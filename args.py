@@ -38,9 +38,13 @@ class Args:
     use_dpo: bool = True        #   Use DPO instead of GRPO
     dpo_beta: float = 0.2        # DPO temperature parameter
     n_preference_pairs: int = 8 # Max number of preference pairs per step
-    diversity_threshold: float = 0.01  # Minimum diversity for preference pairs (降低以便选择更多对)
-    pref_gap_min: float = 0.001   # Minimum performance gap (0.1%)
-    pref_gap_max: float = 1.5    # Maximum performance gap (150%)
+    diversity_threshold: float = 0.05  # Minimum diversity for preference pairs
+    pref_gap_min: float = 0.01   # Minimum performance gap
+    pref_gap_max: float = 0.9    # Maximum performance gap
+
+    # DAR sampling parameters
+    dar_n_buckets: int = 5       # Number of performance buckets for DAR
+    dar_temperature: float = 3.0 # Temperature for bucket sampling (explore vs exploit)
 
     @staticmethod
     def from_terminal():

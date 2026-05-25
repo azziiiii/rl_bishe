@@ -1,5 +1,6 @@
 import os
 from os import path
+import json
 import pynvml
 import argparse
 import traceback
@@ -90,8 +91,9 @@ def run(calm_args: CALM_ARGS):
                 trainer.query_all()
 
             # ============ DPO 训练步骤 ============
-            # 在 DPO 模式下，每轮生成后立即用 DPO 更新模型
-            if calm_args.use_dpo and not online and hasattr(trainer, 'algos') and len(trainer.algos) >= 2:
+            # 预热阶段（前50步）：只生成算法，不更新模型
+            warmup_steps = 10
+            if calm_args.use_dpo and not online and hasattr(trainer, 'algos') and len(trainer.algos) >= 2 and trainer.log_step >= warmup_steps:
                 dpo_metrics = trainer.dpo_training_step()
                 if dpo_metrics:
                     trainer.log_info(f"DPO Training: loss={dpo_metrics.get('dpo_loss', 0):.4f}, pairs={dpo_metrics.get('n_pairs', 0)}")
@@ -107,8 +109,8 @@ def run(calm_args: CALM_ARGS):
     # ============ 训练结束，输出最终结果 ============
     print("\n" + "="*60)
     print("Training Complete!")
-    best_perf = trainer.best_perf
-    print(f"Best performance: {best_perf:.4f}")
+    best_perf = trainer.global_best_perf
+    print(f"Global Best performance: {best_perf:.4f}")
 
     # 保存所有算法的排名
     sorted_algos = sorted(trainer.algos, key=lambda a: a.perf, reverse=True)

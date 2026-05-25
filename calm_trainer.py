@@ -111,7 +111,8 @@ class Trainer:
         self.algos = None
         self.seed_algos = []
         self.age_stuck = 0
-        
+        self.global_best_perf = -float('inf')  # Track true global best across all steps
+
         self.n_prompts = calm_args.n_prompts
         self.population_size = calm_args.population_size
 
@@ -207,20 +208,10 @@ class Trainer:
             self.algos = self.get_algos_and_performance()
             for init_algo in self.algos:
                 self.seed_algos.append(init_algo)
+                if init_algo.perf is not None:
+                    self.global_best_perf = max(self.global_best_perf, init_algo.perf)
 
-        max_stuck_threshold = self.calm_args.max_steps // 20 if self.calm_args.max_stuck_threshold < 0 else self.calm_args.max_stuck_threshold
-        if np.random.random() < self.calm_args.speed_collapse * self.age_stuck or self.age_stuck >= max_stuck_threshold:
-            self.log_info(f"\n Collapse after stucking for {self.age_stuck} rounds \n")
-            self.age_stuck = 0
-            if len(self.algos) > 0:
-                self.used_prompts = []
-                best_algo = self.algos[np.argmax([a.perf for a in self.algos])]
-                self.log_info(f"During collapse, the best algo with perf {best_algo.perf} has been kept")
-                self.algos = [best_algo]
-                for seed_algo in self.seed_algos:
-                    if seed_algo not in self.algos:
-                        self.algos.append(seed_algo)
-
+        # 按性能排序，保持最好的在前面
         sorted_indices = np.argsort([a.perf for a in self.algos])[::-1]
         self.algos = [self.algos[i] for i in sorted_indices]
 
@@ -248,7 +239,7 @@ class Trainer:
             n_ops[i_op] += 1
         ub_simplification, ub_injection, ub_replacement, ub_crossover = n_ops
         self.log_info(f'UB of OPs: simplification - {ub_simplification}, injection - {ub_injection}, replacement - {ub_replacement}, crossover - {ub_crossover}')
-        
+
         rank = 1 + np.arange(len(algos_head))
         p = 1 / rank
         p /= np.sum(p)
@@ -312,7 +303,6 @@ class Trainer:
                 ])
                 self.log_info(log_msg)
                 n_new_crossover += 1
-
 
             # --------------------------------- Creation --------------------------------- #
             if len(dataset_dict['prompt']) == 0:
@@ -554,12 +544,14 @@ class Trainer:
                         break
 
             best_base_perf = np.max([a.perf for a in base_algos])
+            is_global_best = algo.perf > self.global_best_perf
             is_better = algo.perf > best_base_perf
-            if is_better:
+            if is_global_best:
                 self.age_stuck = 0
+                self.global_best_perf = algo.perf
                 self.log_info(f"Better performance: {algo.perf} at step {self.log_step} by {algo_name}")
                 self.log_info(f"Idea: {algo.idea}")
-                
+
                 # 只保存best算法
                 os.makedirs(path.join(self.save_dir, 'algos'), exist_ok=True)
                 algo_filename = f"S{self.log_step}_{algo.sid}.py"
@@ -605,7 +597,7 @@ class Trainer:
         # 打印过滤统计
         filter_msg = f"[Filter] idea_not_exist={filter_stats['idea_not_exist']}, code_not_exist={filter_stats['code_not_exist']}, function_not_exist={filter_stats['function_not_exist']}, bug_in_function={filter_stats['bug_in_function']}, random={filter_stats['random_algorithm']}, success={filter_stats['success']}"
         self.log_info(filter_msg)
-
+        
         return res
     
     @property
@@ -699,71 +691,156 @@ class Trainer:
         return res
 
     # =========================================================================
-    # DPO Preference Pair Selection (UCPO + ADPO)
+    # DPO Preference Pair Selection (DAR + Diversity)
     # =========================================================================
     def select_preference_pairs(self, candidates, prompt_context=None):
         """
-        Select preference pairs using ADPO (Adaptive Diversity Preference Optimization):
-        Moderate performance gap + diversity filtering
-        Excludes seed algorithms to avoid anchoring the model.
+        Select preference pairs using DAR (Diversity-Aware Rank-based) sampling:
+        - Partition candidates into M buckets by performance rank
+        - Sample chosen from higher-ranked buckets (with temperature-controlled probability)
+        - Sample rejected from buckets at least 2 ranks away
+        - Diversity filtering to avoid learning from similar algos
+        
+        This prevents:
+        1. Always picking best vs worst (overfitting to extremes)
+        2. Learning from nearly identical algos (waste of training signal)
         """
         if len(candidates) < 2:
             return []
 
-        # 排除seed算法，避免模型被seed锚定
+        # Exclude seed algorithms to avoid anchoring
         non_seed_candidates = [c for c in candidates if 'seed' not in c.sid.lower()]
         if len(non_seed_candidates) < 2:
-            self.log_info(f"[ADPO] Only {len(non_seed_candidates)} non-seed candidates, skipping preference pairs")
+            self.log_info(f"[DAR] Only {len(non_seed_candidates)} non-seed candidates, skipping preference pairs")
             return []
-        
-        selected_pairs = []
-        used_base_algos = set()
 
-        # Sort candidates by performance (descending)
+        # Sort by performance (descending)
         candidates_sorted = sorted(non_seed_candidates, key=lambda x: x.perf, reverse=True)
         
-        # Debug: 打印candidates信息和gap条件
-        self.log_info(f"[ADPO Debug] candidates={len(candidates_sorted)} (excluded seed), perfs={[f'{c.perf:.2f}' for c in candidates_sorted]}, gap_range=[{self.pref_gap_min}, {self.pref_gap_max}]")
-
-        for i, better_algo in enumerate(candidates_sorted):
-            if len(selected_pairs) >= self.n_preference_pairs:
-                break
-
-            # Try to find a suitable worse algo for this candidate
-            for worse_algo in candidates_sorted[i+1:]:
-                # Calculate performance gap
-                gap = better_algo.perf - worse_algo.perf
-                perf_scale = max(abs(better_algo.perf), abs(worse_algo.perf), 1e-6)
-                relative_gap = abs(gap) / perf_scale
-
-                # ADPO: moderate gap (pref_gap_min ~ pref_gap_max)
-                if relative_gap < self.pref_gap_min or relative_gap > self.pref_gap_max:
-                    # Debug: gap too small or too large
-                    continue
-
+        # Index map to avoid O(n^2) list.index lookups
+        idx_of = {a.sid: i for i, a in enumerate(candidates_sorted)}
+        
+        # Compute diversity matrix for all pairs
+        n = len(candidates_sorted)
+        diversity_matrix = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = self._calculate_diversity(candidates_sorted[i], candidates_sorted[j])
+                diversity_matrix[i, j] = d
+                diversity_matrix[j, i] = d
+        
+        # DAR: Partition into M buckets
+        M = min(self.calm_args.dar_n_buckets, n)  # Number of buckets
+        bucket_size = max(1, n // M)
+        
+        buckets = []
+        for i in range(0, n, bucket_size):
+            bucket = candidates_sorted[i:i + bucket_size]
+            if bucket:
+                buckets.append(bucket)
+        
+        M = len(buckets)
+        
+        # Temperature-controlled sampling for chosen (y+)
+        # Higher-ranked buckets have higher probability (exploitation vs exploration)
+        tau = self.calm_args.dar_temperature  # Temperature parameter
+        bucket_probs = np.exp(np.arange(M - 2) / tau)  # Exclude last 2 buckets
+        bucket_probs /= bucket_probs.sum()
+        
+        selected_pairs = []
+        used_alg_ids = set()
+        
+        # Adaptive gap range based on performance distribution
+        perfs = np.array([a.perf for a in candidates_sorted])
+        perf_std = np.std(perfs) if len(perfs) > 1 else 1.0
+        adaptive_gap_min = max(self.pref_gap_min, 0.02)  # At least 2%
+        adaptive_gap_max = self.pref_gap_max
+        
+        max_attempts = self.n_preference_pairs * 10
+        attempt = 0
+        
+        self.log_info(f"[DAR Debug] n_candidates={n}, M_buckets={M}, tau={tau:.2f}, "
+                      f"perf_std={perf_std:.4f}, gap_range=[{adaptive_gap_min:.3f}, {adaptive_gap_max:.3f}]")
+        
+        while len(selected_pairs) < self.n_preference_pairs and attempt < max_attempts:
+            attempt += 1
+            
+            # Sample chosen bucket (from top M-2 buckets)
+            try:
+                chosen_bucket_idx = np.random.choice(M - 2, p=bucket_probs)
+            except:
+                chosen_bucket_idx = 0
+            chosen_bucket = buckets[chosen_bucket_idx]
+            
+            # Sample chosen algo from chosen bucket (prefer higher-ranked within bucket)
+            if len(chosen_bucket) > 1:
+                # Weight by reverse rank within bucket
+                weights = np.linspace(1.0, 0.5, len(chosen_bucket))
+                weights /= weights.sum()
+                chosen_algo = np.random.choice(chosen_bucket, p=weights)
+            else:
+                chosen_algo = chosen_bucket[0]
+            
+            # Skip if already used too many times
+            if chosen_algo.sid in used_alg_ids and len(used_alg_ids) >= self.n_preference_pairs:
+                continue
+            
+            # Sample rejected bucket (skip adjacent buckets, at least 2 ranks away)
+            valid_rejected_buckets = []
+            for b_idx in range(chosen_bucket_idx + 2, M):
+                valid_rejected_buckets.append(b_idx)
+            
+            if not valid_rejected_buckets:
+                continue
+            
+            # Weight by diversity - prefer diverse buckets
+            rejected_bucket_idx = np.random.choice(valid_rejected_buckets)
+            rejected_bucket = buckets[rejected_bucket_idx]
+            
+            # Find best diversity match in rejected bucket
+            best_pair = None
+            best_combined_score = -1
+            
+            for rejected_algo in rejected_bucket:
                 # Check diversity
-                better_id = better_algo.sid
-                worse_id = worse_algo.sid
-                if better_id in used_base_algos and len(used_base_algos) >= self.n_preference_pairs // 2:
-                    # Debug: used_base_algos restriction
+                ci = idx_of.get(chosen_algo.sid)
+                rj = idx_of.get(rejected_algo.sid)
+                if ci is None or rj is None:
                     continue
-
-                # Calculate diversity score
-                diversity = self._calculate_diversity(better_algo, worse_algo)
-
-                # Add pair
-                selected_pairs.append({
-                    'better': better_algo,
-                    'worse': worse_algo,
-                    'gap': gap,
-                    'relative_gap': relative_gap,
-                    'diversity': diversity
-                })
-                used_base_algos.add(better_id)
-                used_base_algos.add(worse_id)
-                self.log_info(f"[ADPO] Selected pair: {better_algo.sid}(perf={better_algo.perf:.2f}) > {worse_algo.sid}(perf={worse_algo.perf:.2f}), gap={relative_gap:.4f}")
-                break
-
+                div = diversity_matrix[ci, rj]
+                
+                if div < self.diversity_threshold:
+                    continue
+                
+                # Check performance gap
+                gap = abs(chosen_algo.perf - rejected_algo.perf)
+                perf_scale = max(abs(chosen_algo.perf), abs(rejected_algo.perf), 1e-6)
+                relative_gap = gap / perf_scale
+                
+                if relative_gap < adaptive_gap_min or relative_gap > adaptive_gap_max:
+                    continue
+                
+                # Combined score: prefer diverse + moderate gap
+                combined_score = div * 0.5 + (1 - abs(relative_gap - 0.5)) * 0.5
+                
+                if combined_score > best_combined_score:
+                    best_combined_score = combined_score
+                    best_pair = {
+                        'better': chosen_algo,
+                        'worse': rejected_algo,
+                        'gap': gap,
+                        'relative_gap': relative_gap,
+                        'diversity': div
+                    }
+            
+            if best_pair is not None:
+                selected_pairs.append(best_pair)
+                used_alg_ids.add(best_pair['better'].sid)
+                used_alg_ids.add(best_pair['worse'].sid)
+                self.log_info(f"[DAR] Pair: {best_pair['better'].sid}({best_pair['better'].perf:.3f}) > "
+                            f"{best_pair['worse'].sid}({best_pair['worse'].perf:.3f}), "
+                            f"gap={relative_gap:.4f}, div={div:.3f}")
+        
         return selected_pairs[:self.n_preference_pairs]
 
     def _calculate_diversity(self, algo1, algo2):
@@ -856,42 +933,40 @@ class Trainer:
             return torch.tensor(0.0, device=self.model.device if hasattr(self.model, 'device') else 'cpu')
 
         beta = self.calm_args.dpo_beta
-        total_loss = 0.0
-        n_valid = 0
+        loss_list = []
 
         for i, (pair, prompt, chosen, rejected) in enumerate(zip(preference_pairs, prompts, chosen_responses, rejected_responses)):
             try:
-                # Tokenize
                 chosen_ids = self.tokenize(chosen, prompt)
                 rejected_ids = self.tokenize(rejected, prompt)
 
-                # Compute log probabilities
-                with torch.no_grad():
-                    ref_chosen_logps = self._get_log_probabilities(self.reference_model, chosen_ids)
-                    ref_rejected_logps = self._get_log_probabilities(self.reference_model, rejected_ids)
-
-                # Current model log probabilities
+                ref_chosen_logps = self._get_log_probabilities(self.reference_model, chosen_ids)
+                ref_rejected_logps = self._get_log_probabilities(self.reference_model, rejected_ids)
                 chosen_logps = self._get_log_probabilities(self.model, chosen_ids)
                 rejected_logps = self._get_log_probabilities(self.model, rejected_ids)
 
-                # Compute implicit rewards
+                if ref_chosen_logps.numel() == 0 or ref_rejected_logps.numel() == 0 or chosen_logps.numel() == 0 or rejected_logps.numel() == 0:
+                    continue
+
+                ref_chosen_logps = ref_chosen_logps.mean()
+                ref_rejected_logps = ref_rejected_logps.mean()
+                chosen_logps = chosen_logps.mean()
+                rejected_logps = rejected_logps.mean()
+
                 chosen_rewards = beta * (chosen_logps - ref_chosen_logps)
                 rejected_rewards = beta * (rejected_logps - ref_rejected_logps)
 
-                # DPO loss: -log σ( r(y_w) - r(y_l) )
                 logits = chosen_rewards - rejected_rewards
-                loss = -F.logsigmoid(logits).mean()
-
-                total_loss += loss.item()
-                n_valid += 1
+                loss = -F.logsigmoid(logits)
+                loss_list.append(loss)
 
             except Exception as e:
                 continue
 
-        if n_valid == 0:
-            return torch.tensor(0.0, device=self.model.device if hasattr(self.model, 'device') else 'cpu')
+        if not loss_list:
+            return torch.tensor(0.0, device=next(self.model.parameters()).device)
 
-        return torch.tensor(total_loss / n_valid, device=self.model.device if hasattr(self.model, 'device') else 'cpu')
+        return torch.stack(loss_list).mean()
 
     def tokenize(self, text, prompt=None):
         """Tokenize text for model input."""
@@ -919,9 +994,6 @@ class Trainer:
         import torch
         import torch.nn.functional as F
 
-        if input_ids is None:
-            return torch.tensor(0.0)
-
         try:
             # 确保 input_ids 在正确的设备上
             device = model.device if hasattr(model, 'device') else self.ref_device
@@ -944,7 +1016,7 @@ class Trainer:
             if mask.sum() > 0:
                 return (token_log_probs * mask).sum(-1) / mask.sum(-1)
             else:
-                return torch.tensor(0.0, device=device)
+                return torch.tensor(0.0)
 
         except Exception as e:
             return torch.tensor(0.0)
@@ -980,60 +1052,64 @@ class Trainer:
         """手动实现 DPO 训练的备用方案"""
         import torch
         import torch.nn.functional as F
-        
+
         beta = self.calm_args.dpo_beta
-        total_loss = 0.0
-        n_valid = 0
-        
+        loss_list = []
+
         for pair, d in zip(preference_pairs, dpo_data):
             try:
-                # Tokenize
                 chosen_text = d['prompt'] + '\n\n' + d['chosen']
                 rejected_text = d['prompt'] + '\n\n' + d['rejected']
-                
+
                 chosen_ids = self.tokenize(chosen_text)
                 rejected_ids = self.tokenize(rejected_text)
-                
+
                 if chosen_ids is None or rejected_ids is None:
                     continue
-                
-                # Ref model log probs (no grad)
-                with torch.no_grad():
-                    ref_chosen = self._get_log_probabilities(self.reference_model, chosen_ids)
-                    ref_rejected = self._get_log_probabilities(self.reference_model, rejected_ids)
-                
-                # Policy model log probs (need grad)
+
+                ref_chosen = self._get_log_probabilities(self.reference_model, chosen_ids)
+                ref_rejected = self._get_log_probabilities(self.reference_model, rejected_ids)
                 chosen_logps = self._get_log_probabilities(self.model, chosen_ids)
                 rejected_logps = self._get_log_probabilities(self.model, rejected_ids)
-                
-                # DPO loss
+
+                if ref_chosen.numel() == 0 or ref_rejected.numel() == 0 or chosen_logps.numel() == 0 or rejected_logps.numel() == 0:
+                    continue
+
+                ref_chosen = ref_chosen.mean()
+                ref_rejected = ref_rejected.mean()
+                chosen_logps = chosen_logps.mean()
+                rejected_logps = rejected_logps.mean()
+
                 logits = beta * (chosen_logps - ref_chosen - rejected_logps + ref_rejected)
                 loss = -F.logsigmoid(logits)
-                
-                total_loss += loss.item()
-                n_valid += 1
-                
-                # Backward
-                loss.backward()
-                
+                loss_list.append(loss)
+
             except Exception as e:
+                print(f"DPO pair failed: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
-        
-        if n_valid > 0:
-            if hasattr(self, 'optimizer') and self.optimizer:
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-            final_loss = total_loss / n_valid
-        else:
-            final_loss = 0.0
-        
+
+        if not loss_list:
+            return {'dpo_loss': 0.0, 'n_pairs': 0}
+
+        n_valid = len(loss_list)
+        avg_loss = torch.stack(loss_list).mean()
+
+        if hasattr(self, 'optimizer') and self.optimizer:
+            self.optimizer.zero_grad()
+            avg_loss.backward()
+            self.optimizer.step()
+
+        final_loss = avg_loss.item()
+
         dpo_metrics = {
             'dpo_loss': final_loss,
             'n_pairs': n_valid,
         }
-        
+
         self.log_info(f"[DPO] Loss={final_loss:.4f}, Pairs={n_valid}")
-        
+
         return dpo_metrics
 
     # =========================================================================
