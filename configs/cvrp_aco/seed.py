@@ -1,0 +1,6 @@
+# The idea of the algorithm is to return the element-wise reciprocal of the distance matrix
+
+import numpy as np
+
+def heuristics(distance_matrix: np.ndarray, coordinates: np.ndarray, demands: np.ndarray, capacity: int) -> np.ndarray:
+    return 1 / distance_matrix
