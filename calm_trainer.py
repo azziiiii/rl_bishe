@@ -131,32 +131,23 @@ class Trainer:
         self.use_dpo = calm_args.use_dpo
         if self.use_dpo and not self.online:
             import torch
-            # 对于 unsloth + LoRA + vLLM，deepcopy 会复制 vLLM 状态导致 OOM
-            # 解决方案：单独加载一个 4bit 的 ref model（不共享 vLLM 状态）
             from unsloth import FastLanguageModel
+            self.ref_device = next(self.model.parameters()).device
+
             try:
                 self.reference_model, _ = FastLanguageModel.from_pretrained(
                     model_name=calm_args.model_name,
                     max_seq_length=4096,
-                    load_in_4bit=True,  # 4bit 量化，显存占用小
+                    load_in_4bit=True,
                 )
                 for param in self.reference_model.parameters():
                     param.requires_grad = False
                 self.reference_model.eval()
-                # 确保 ref model 在同一设备上
-                self.ref_device = next(self.model.parameters()).device
                 self.reference_model = self.reference_model.to(self.ref_device)
+                print("[DPO] Reference model loaded (4bit base, frozen)")
             except Exception as e:
-                print(f"Warning: Failed to load separate ref model: {e}")
-                print("Fallback to using base model as reference")
-                if hasattr(self.model, 'model') and hasattr(self.model.model, 'base_model'):
-                    self.reference_model = self.model.model.base_model
-                elif hasattr(self.model, 'base_model'):
-                    self.reference_model = self.model.base_model
-                else:
-                    self.reference_model = self.model
-                self.reference_model.eval()
-                self.ref_device = next(self.model.parameters()).device
+                print(f"Warning: Failed to load ref model: {e}")
+                self.reference_model = None
         self.preference_pairs = []  # List of (prompt, chosen_algo, rejected_algo)
 
         # DPO hyper-parameters for preference pair selection
@@ -178,11 +169,28 @@ class Trainer:
             # DPO 模式：不初始化 GRPOTrainer，避免不必要的设置
             if self.use_dpo:
                 # DPO 模式下，设置 optimizer 用于 DPO 更新
-                # 注意：不覆盖 train_dataset，它在 prepare_dataset() 中已经设置好了
                 import torch.optim as optim
-                # 获取可训练参数（LoRA 参数）
                 trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+
+                # 诊断：找 LoRA 参数藏在哪里
+                lora_named = [(n, p.numel()) for n, p in self.model.named_parameters() if 'lora' in n.lower() and p.requires_grad]
+                if lora_named:
+                    total_lora = sum(s for _, s in lora_named)
+                    print(f"[DPO] LoRA params (requires_grad=True): {len(lora_named)} modules, {total_lora} elements")
+                    for n, s in lora_named[:3]:
+                        print(f"       {n}: {s}")
+                else:
+                    print(f"[DPO] WARNING: No LoRA params found with requires_grad=True!")
+                    print(f"[DPO] All requires_grad params: {len(trainable_params)} (total {sum(p.numel() for p in trainable_params)} elements)")
+                    # 打印所有 lora 参数（不看 requires_grad）
+                    all_lora = [(n, p.numel(), p.requires_grad) for n, p in self.model.named_parameters() if 'lora' in n.lower()]
+                    print(f"[DPO] All LoRA params (any grad): {len(all_lora)} modules, total {sum(s for _, s, _ in all_lora)} elements")
+                    if all_lora:
+                        for n, s, rg in all_lora[:5]:
+                            print(f"       {n}: {s} elem, requires_grad={rg}")
+
                 self.optimizer = optim.AdamW(trainable_params, lr=calm_args.lr, betas=(0.9, 0.99))
+                print(f"[DPO] Optimizer: {len(trainable_params)} trainable params")
     
     @property
     def best_perf(self):
@@ -948,10 +956,11 @@ class Trainer:
                 if ref_chosen_logps.numel() == 0 or ref_rejected_logps.numel() == 0 or chosen_logps.numel() == 0 or rejected_logps.numel() == 0:
                     continue
 
-                ref_chosen_logps = ref_chosen_logps.mean()
-                ref_rejected_logps = ref_rejected_logps.mean()
-                chosen_logps = chosen_logps.mean()
-                rejected_logps = rejected_logps.mean()
+                device = next(self.model.parameters()).device
+                ref_chosen_logps = ref_chosen_logps.to(device).mean()
+                ref_rejected_logps = ref_rejected_logps.to(device).mean()
+                chosen_logps = chosen_logps.to(device).mean()
+                rejected_logps = rejected_logps.to(device).mean()
 
                 chosen_rewards = beta * (chosen_logps - ref_chosen_logps)
                 rejected_rewards = beta * (rejected_logps - ref_rejected_logps)
@@ -966,6 +975,8 @@ class Trainer:
         if not loss_list:
             return torch.tensor(0.0, device=next(self.model.parameters()).device)
 
+        device = next(self.model.parameters()).device
+        loss_list = [l.to(device) for l in loss_list]
         return torch.stack(loss_list).mean()
 
     def tokenize(self, text, prompt=None):
@@ -995,31 +1006,27 @@ class Trainer:
         import torch.nn.functional as F
 
         try:
-            # 确保 input_ids 在正确的设备上
             device = model.device if hasattr(model, 'device') else self.ref_device
             input_ids = {k: v.to(device) for k, v in input_ids.items()}
-            
-            # 需要梯度来计算DPO loss
+
+            if hasattr(model, 'train'):
+                model.train()
             outputs = model(**input_ids)
             logits = outputs.logits
 
-            # Shift for next-token prediction
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = input_ids['input_ids'][..., 1:].contiguous()
-
-            # Log probabilities
             log_probs = F.log_softmax(shift_logits, dim=-1)
             token_log_probs = torch.gather(log_probs, dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)
-
-            # Mean over non-padding tokens
             mask = (shift_labels != self.tokenizer.pad_token_id).float()
+
             if mask.sum() > 0:
                 return (token_log_probs * mask).sum(-1) / mask.sum(-1)
             else:
-                return torch.tensor(0.0)
+                return torch.tensor(0.0, device=device)
 
         except Exception as e:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device=device)
 
     # =========================================================================
     # DPO Training Step
@@ -1029,23 +1036,17 @@ class Trainer:
         Execute one step of DPO training using manual implementation.
         """
         if preference_pairs is None:
-            # Collect candidates from current population
             candidates = list(self.algos) if hasattr(self, 'algos') else []
             if not candidates:
                 return {'dpo_loss': 0.0, 'n_pairs': 0}
             preference_pairs = self.select_preference_pairs(candidates)
+            if not preference_pairs:
+                return {'dpo_loss': 0.0, 'n_pairs': 0}
+            dpo_data = self.prepare_dpo_dataset(preference_pairs)
 
-        if not preference_pairs:
-            return {'dpo_loss': 0.0, 'n_pairs': 0}
-
-        # Prepare DPO dataset
-        dpo_data = self.prepare_dpo_dataset(preference_pairs)
-
-        # Ensure model is in training mode for gradients
         if hasattr(self.model, 'train'):
             self.model.train()
-        
-        # Use manual DPO training
+
         return self._manual_dpo_training(preference_pairs, dpo_data)
     
     def _manual_dpo_training(self, preference_pairs, dpo_data):
@@ -1067,18 +1068,22 @@ class Trainer:
                 if chosen_ids is None or rejected_ids is None:
                     continue
 
+                # Reference logps
                 ref_chosen = self._get_log_probabilities(self.reference_model, chosen_ids)
                 ref_rejected = self._get_log_probabilities(self.reference_model, rejected_ids)
+
+                # Policy logps
                 chosen_logps = self._get_log_probabilities(self.model, chosen_ids)
                 rejected_logps = self._get_log_probabilities(self.model, rejected_ids)
 
                 if ref_chosen.numel() == 0 or ref_rejected.numel() == 0 or chosen_logps.numel() == 0 or rejected_logps.numel() == 0:
                     continue
 
-                ref_chosen = ref_chosen.mean()
-                ref_rejected = ref_rejected.mean()
-                chosen_logps = chosen_logps.mean()
-                rejected_logps = rejected_logps.mean()
+                device = next(self.model.parameters()).device
+                ref_chosen = ref_chosen.to(device).mean()
+                ref_rejected = ref_rejected.to(device).mean()
+                chosen_logps = chosen_logps.to(device).mean()
+                rejected_logps = rejected_logps.to(device).mean()
 
                 logits = beta * (chosen_logps - ref_chosen - rejected_logps + ref_rejected)
                 loss = -F.logsigmoid(logits)
@@ -1094,6 +1099,8 @@ class Trainer:
             return {'dpo_loss': 0.0, 'n_pairs': 0}
 
         n_valid = len(loss_list)
+        device = next(self.model.parameters()).device
+        loss_list = [l.to(device) for l in loss_list]
         avg_loss = torch.stack(loss_list).mean()
 
         if hasattr(self, 'optimizer') and self.optimizer:
